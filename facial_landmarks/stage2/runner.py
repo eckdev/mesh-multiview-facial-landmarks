@@ -1,0 +1,2029 @@
+#!/usr/bin/env python3
+import copy
+import csv
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from facial_landmarks.stage2.model import AGHFormerVNext
+from facial_landmarks.stage2.hairline_mandible import (
+    Hard3StructuredConfig,
+    apply_hard3_blend,
+    calibrate_hard3_blend,
+    fit_or_load_hard3_refiner,
+)
+from facial_landmarks.stage2.shape_prior import TrainOnlyShapePrior
+from facial_landmarks.optional.context_refiner import (
+    Hard3DualViewConfig,
+    apply_dual_view_blend,
+    calibrate_dual_view_blend,
+    fit_or_load_dual_view_refiner,
+)
+from facial_landmarks.optional.curve_refiner import (
+    CurveHard3Config,
+    fit_or_load_curve_hard3_refiner,
+)
+from facial_landmarks.refiner_base import (
+    Core20MVSCConfig,
+    apply_core20_refinement,
+    calibrate_core20_policy,
+    fit_or_load_core20_refiner,
+    run_core20_preflight,
+)
+from facial_landmarks.refiner_base.refiner import (
+    write_core20_reports,
+    write_core20_split_report,
+)
+from facial_landmarks.core.anatomy import (
+    ANATOMICAL_EDGES,
+    CORE20,
+    HARD3,
+    LANDMARK_NAMES,
+    MIDLINE,
+    SYMMETRY_PAIRS,
+)
+from facial_landmarks.core.data import discover_samples, load_split_file
+from facial_landmarks.core.losses import LossWeights
+from facial_landmarks.core.metrics import (
+    calibrate_confidence,
+    save_evaluation,
+    write_csv,
+)
+from facial_landmarks.core.runner import (
+    build_parser as build_base_parser,
+    fold_output_dir,
+    limit_splits,
+    make_cv_splits,
+    make_loader,
+    prepare_fold,
+    resolve_device,
+    resolve_precision,
+    set_seed,
+    validate_preprocessing_root,
+)
+from facial_landmarks.core.train import (
+    apply_refinement_calibration,
+    collect_outputs,
+    fit_model,
+    fit_refinement_calibration,
+    fit_separate_refinement_gate,
+)
+
+
+def configure_vnext(args):
+    args.experiment = "AGH_VNEXT"
+    args.use_rgb = True
+    args.use_local_refiner = True
+    args.use_anatomical_attention = True
+    args.use_specialized_heads = True
+    args.use_refinement_gate = True
+    args.use_hard_candidate_ranker = True
+    args.use_e10_rankers = True
+    args.separate_gate_training = True
+    args.hard_rank_mode = "soft_listwise"
+    return args
+
+
+def build_parser():
+    parser = build_base_parser()
+    parser.description = "Leakage-free AGH-Former vNext with OOF coarse fusion"
+    parser.set_defaults(
+        protocol="cv",
+        coarse_source="stage1_oof",
+        train_center_mode="external",
+        alignment="mesh_icp",
+        experiment="AGH_VNEXT",
+        coordinate_mode="mse_over_mesh",
+        tta=True,
+        tta_validation=True,
+        hard_landmark_weight=2.0,
+        hard_rank_weight=0.5,
+        gate_weight=0.0,
+        mirror_probability=0.5,
+        checkpoint_metric="balanced",
+        checkpoint_hard3_weight=0.25,
+        refinement_calibration="none",
+        stage1_oof_mode="fixed_epoch",
+    )
+    parser.add_argument("--token-blocks", type=int, default=2)
+    parser.add_argument("--token-surface-points", type=int, default=4096)
+    parser.add_argument("--fusion-residual-limit-mm", type=float, default=8.0)
+    parser.add_argument("--fusion-hard-residual-limit-mm", type=float, default=15.0)
+    parser.add_argument("--no-shape-prior", dest="shape_prior", action="store_false")
+    parser.set_defaults(shape_prior=True)
+    parser.add_argument("--shape-prior-components", default="6,10,15,20,30")
+    parser.add_argument("--shape-prior-l2", default="0.1,1,10,100")
+    parser.add_argument(
+        "--shape-prior-max-core-regression-mm", type=float, default=0.03
+    )
+    parser.add_argument("--shape-prior-min-val-gain-mm", type=float, default=0.01)
+    parser.add_argument(
+        "--no-hard3-structured", dest="hard3_structured", action="store_false"
+    )
+    parser.set_defaults(hard3_structured=True)
+    parser.add_argument(
+        "--hard3-refiner-mode",
+        choices=("dual_view", "curve_supervised", "structured"),
+        default="dual_view",
+        help=(
+            "curve_supervised first learns the anatomical support curve; dual_view "
+            "uses RGB-depth patches; structured keeps the legacy point ranker"
+        ),
+    )
+    parser.add_argument("--hard3-structured-folds", type=int, default=5)
+    parser.add_argument("--hard3-structured-epochs", type=int, default=70)
+    parser.add_argument("--hard3-structured-min-epochs", type=int, default=20)
+    parser.add_argument("--hard3-structured-patience", type=int, default=12)
+    parser.add_argument("--hard3-structured-batch-size", type=int, default=12)
+    parser.add_argument("--hard3-structured-width", type=int, default=32)
+    parser.add_argument("--hard3-structured-dropout", type=float, default=0.25)
+    parser.add_argument("--hard3-structured-pair-topk", type=int, default=24)
+    parser.add_argument("--hard3-structured-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-structured-weight-decay", type=float, default=5e-3)
+    parser.add_argument("--hard3-structured-grad-clip", type=float, default=1.0)
+    parser.add_argument("--hard3-structured-sigma-lm0", type=float, default=2.5)
+    parser.add_argument("--hard3-structured-sigma-gonion", type=float, default=3.0)
+    parser.add_argument(
+        "--hard3-structured-coordinate-weight", type=float, default=0.25
+    )
+    parser.add_argument("--hard3-structured-negative-weight", type=float, default=0.15)
+    parser.add_argument("--hard3-structured-negative-margin", type=float, default=0.5)
+    parser.add_argument("--hard3-structured-feature-noise", type=float, default=0.02)
+    parser.add_argument("--hard3-structured-max-step-lm0", type=float, default=12.0)
+    parser.add_argument("--hard3-structured-max-step-gonion", type=float, default=15.0)
+    parser.add_argument(
+        "--hard3-structured-min-overall-gain-mm", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--hard3-structured-min-hard3-gain-mm", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--hard3-structured-min-improvement-probability", type=float, default=0.90
+    )
+    parser.add_argument(
+        "--hard3-structured-max-p95-regression-mm", type=float, default=0.10
+    )
+    parser.add_argument("--hard3-stage3-full-cv-max-overall", type=float, default=2.25)
+    parser.add_argument("--hard3-stage3-full-cv-max-hard3", type=float, default=4.00)
+    parser.add_argument("--hard3-dual-view-folds", type=int, default=5)
+    parser.add_argument("--hard3-dual-view-epochs", type=int, default=90)
+    parser.add_argument("--hard3-dual-view-min-epochs", type=int, default=30)
+    parser.add_argument("--hard3-dual-view-patience", type=int, default=15)
+    parser.add_argument("--hard3-dual-view-batch-size", type=int, default=8)
+    parser.add_argument("--hard3-dual-view-image-size", type=int, default=64)
+    parser.add_argument("--hard3-dual-view-width", type=int, default=24)
+    parser.add_argument("--hard3-dual-view-dropout", type=float, default=0.10)
+    parser.add_argument("--hard3-dual-view-radius-scale", type=float, default=1.0)
+    parser.add_argument("--hard3-dual-view-translation-pixels", type=int, default=4)
+    parser.add_argument("--hard3-dual-view-color-noise", type=float, default=0.025)
+    parser.add_argument("--hard3-dual-view-lr", type=float, default=3e-4)
+    parser.add_argument("--hard3-dual-view-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--hard3-dual-view-grad-clip", type=float, default=1.0)
+    parser.add_argument("--hard3-dual-view-sigma-lm0", type=float, default=3.0)
+    parser.add_argument("--hard3-dual-view-sigma-gonion", type=float, default=4.0)
+    parser.add_argument("--hard3-dual-view-heatmap-weight", type=float, default=1.0)
+    parser.add_argument("--hard3-dual-view-poss-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-dual-view-poss-exponent", type=float, default=2.0)
+    parser.add_argument("--hard3-dual-view-poss-temperature", type=float, default=0.1)
+    parser.add_argument("--hard3-dual-view-ranking-weight", type=float, default=0.5)
+    parser.add_argument("--hard3-dual-view-coordinate-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-dual-view-pair-weight", type=float, default=0.10)
+    parser.add_argument("--hard3-dual-view-joint-pair-weight", type=float, default=0.75)
+    parser.add_argument(
+        "--hard3-dual-view-joint-pair-negative-weight", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--hard3-dual-view-decoder-mode",
+        choices=(
+            "crossfit_mixture_state",
+            "crossfit_global_contour",
+            "crossfit_multiscale_contour",
+            "crossfit_set_context",
+            "crossfit_interaction",
+            "crossfit_calibrated",
+            "contour_coordinate",
+            "full_pair",
+            "sharp_pruned",
+        ),
+        default="crossfit_mixture_state",
+    )
+    parser.add_argument("--hard3-dual-view-proposal-topk", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-pair-temperature", type=float, default=0.5)
+    parser.add_argument("--hard3-dual-view-proposal-neighbors", type=int, default=12)
+    parser.add_argument("--hard3-dual-view-teacher-forcing-epochs", type=int, default=0)
+    parser.add_argument("--hard3-dual-view-rerank-sigma", type=float, default=2.0)
+    parser.add_argument(
+        "--hard3-dual-view-rerank-temperature", type=float, default=0.75
+    )
+    parser.add_argument(
+        "--hard3-dual-view-rerank-expected-distance-weight",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--hard3-dual-view-rerank-ordinal-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-rerank-negative-radius-mm", type=float, default=3.0
+    )
+    parser.add_argument("--hard3-dual-view-rerank-stage-epochs", type=int, default=40)
+    parser.add_argument(
+        "--hard3-dual-view-rerank-stage-min-epochs", type=int, default=10
+    )
+    parser.add_argument("--hard3-dual-view-rerank-stage-patience", type=int, default=10)
+    parser.add_argument("--hard3-dual-view-rerank-stage-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-dual-view-pair-stage-epochs", type=int, default=40)
+    parser.add_argument("--hard3-dual-view-pair-stage-min-epochs", type=int, default=10)
+    parser.add_argument("--hard3-dual-view-pair-stage-patience", type=int, default=10)
+    parser.add_argument("--hard3-dual-view-pair-stage-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-dual-view-pair-target-sigma", type=float, default=1.5)
+    parser.add_argument(
+        "--hard3-dual-view-pair-listwise-weight", type=float, default=0.75
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-unary-listwise-weight", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-clinical-radius-mm", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-clinical-mass-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-expected-distance-weight",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-hard-negative-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-hard-negative-radius-mm", type=float, default=4.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-hard-negative-count", type=int, default=64
+    )
+    parser.add_argument(
+        "--hard3-dual-view-pair-validation-mode",
+        choices=("pair_soft", "pair_argmax", "pair_snapped"),
+        default="pair_argmax",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-state-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-moment-weight", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-state-scale", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-residual-limit", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-l2-grid",
+        default="0.001,0.01,0.1,1,10",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-shortlist-grid", default="32,48,96"
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-contour-weight-grid",
+        default="0,0.25,0.5,1,2",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-state-weight-grid",
+        default="0,0.25,0.5,1,2,4",
+    )
+    parser.add_argument("--hard3-dual-view-interaction-shortlist", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-interaction-width", type=int, default=24)
+    parser.add_argument(
+        "--hard3-dual-view-interaction-dropout", type=float, default=0.10
+    )
+    parser.add_argument("--hard3-dual-view-interaction-epochs", type=int, default=100)
+    parser.add_argument(
+        "--hard3-dual-view-interaction-min-epochs", type=int, default=30
+    )
+    parser.add_argument("--hard3-dual-view-interaction-patience", type=int, default=15)
+    parser.add_argument("--hard3-dual-view-interaction-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--hard3-dual-view-interaction-weight-decay", type=float, default=1e-3
+    )
+    parser.add_argument("--hard3-dual-view-interaction-sigma", type=float, default=2.5)
+    parser.add_argument(
+        "--hard3-dual-view-interaction-expected-distance-weight",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--hard3-dual-view-interaction-coordinate-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-interaction-pair-weight", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--hard3-dual-view-interaction-hard-negative-weight",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--hard3-dual-view-interaction-negative-radius-mm",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--hard3-dual-view-interaction-negative-margin", type=float, default=0.5
+    )
+    parser.add_argument("--hard3-dual-view-set-shortlist", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-set-width", type=int, default=24)
+    parser.add_argument("--hard3-dual-view-set-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--hard3-dual-view-set-candidate-dropout", type=float, default=0.10
+    )
+    parser.add_argument("--hard3-dual-view-set-epochs", type=int, default=100)
+    parser.add_argument("--hard3-dual-view-set-min-epochs", type=int, default=30)
+    parser.add_argument("--hard3-dual-view-set-patience", type=int, default=15)
+    parser.add_argument("--hard3-dual-view-set-lr", type=float, default=1e-3)
+    parser.add_argument("--hard3-dual-view-set-weight-decay", type=float, default=1e-3)
+    parser.add_argument("--hard3-dual-view-set-sigma", type=float, default=2.5)
+    parser.add_argument(
+        "--hard3-dual-view-set-expected-distance-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-coordinate-weight", type=float, default=0.25
+    )
+    parser.add_argument("--hard3-dual-view-set-pair-weight", type=float, default=0.10)
+    parser.add_argument(
+        "--hard3-dual-view-set-clinical-mass-weight", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-hard-negative-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-negative-radius-mm", type=float, default=4.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-negative-margin", type=float, default=0.5
+    )
+    parser.add_argument("--hard3-dual-view-multiscale-shortlist", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-multiscale-hops", default="1,2,3")
+    parser.add_argument(
+        "--hard3-dual-view-multiscale-feature-modes",
+        default="compact,geometry,contour",
+    )
+    parser.add_argument("--hard3-dual-view-multiscale-l2-grid", default="0.01,0.1,1,10")
+    parser.add_argument(
+        "--hard3-dual-view-multiscale-descriptor-weight-grid",
+        default="0,0.25,0.5,1",
+    )
+    parser.add_argument("--hard3-dual-view-mixture-shortlist", type=int, default=96)
+    parser.add_argument(
+        "--hard3-dual-view-mixture-feature-modes",
+        default="coordinate,evidence,evidence_shape",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-mixture-l2-grid", default="0.01,0.1,1,10,100"
+    )
+    parser.add_argument(
+        "--hard3-dual-view-mixture-alpha-grid", default="0.25,0.5,0.75,1"
+    )
+    parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
+    parser.add_argument(
+        "--hard3-dual-view-gonion-color-dropout", type=float, default=0.25
+    )
+    parser.add_argument("--hard3-dual-view-atlas-neighbors", type=int, default=8)
+    parser.add_argument("--hard3-dual-view-atlas-temperature", type=float, default=2.0)
+    parser.add_argument("--hard3-dual-view-final-members", type=int, default=3)
+    parser.add_argument(
+        "--hard3-dual-view-final-policy",
+        choices=("inner_fold_ensemble", "median_best_refit"),
+        default="inner_fold_ensemble",
+    )
+    parser.add_argument("--hard3-dual-view-diagnostic-topk", default="32,48,96")
+    parser.add_argument(
+        "--hard3-dual-view-min-proposal-recall", type=float, default=0.90
+    )
+    parser.add_argument(
+        "--hard3-dual-view-max-proposal-oracle-ale", type=float, default=1.50
+    )
+    parser.add_argument("--hard3-dual-view-min-proposal-sdr2", type=float, default=0.75)
+    parser.add_argument(
+        "--hard3-dual-view-max-proposal-oracle-p95", type=float, default=3.50
+    )
+    parser.add_argument("--hard3-dual-view-target-ale", type=float, default=4.0)
+    parser.add_argument("--hard3-curve-annotation-manifest")
+    parser.add_argument(
+        "--hard3-curve-run-mode",
+        choices=("pseudo", "pilot", "publication"),
+        default="pseudo",
+    )
+    parser.add_argument("--hard3-curve-min-annotated-samples", type=int, default=0)
+    parser.add_argument(
+        "--hard3-curve-publication-min-annotated-samples", type=int, default=60
+    )
+    parser.add_argument(
+        "--hard3-curve-max-annotation-surface-distance-mm", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--hard3-curve-max-landmark-curve-distance-mm", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--hard3-curve-allow-pseudo",
+        dest="hard3_curve_allow_pseudo",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-hard3-curve-pseudo",
+        dest="hard3_curve_allow_pseudo",
+        action="store_false",
+    )
+    parser.set_defaults(hard3_curve_allow_pseudo=True)
+    parser.add_argument("--hard3-curve-folds", type=int, default=5)
+    parser.add_argument("--hard3-curve-epochs", type=int, default=100)
+    parser.add_argument("--hard3-curve-min-epochs", type=int, default=30)
+    parser.add_argument("--hard3-curve-patience", type=int, default=15)
+    parser.add_argument("--hard3-curve-batch-size", type=int, default=8)
+    parser.add_argument("--hard3-curve-image-size", type=int, default=64)
+    parser.add_argument("--hard3-curve-width", type=int, default=48)
+    parser.add_argument("--hard3-curve-blocks", type=int, default=2)
+    parser.add_argument("--hard3-curve-dropout", type=float, default=0.10)
+    parser.add_argument("--hard3-curve-radius-scale", type=float, default=1.25)
+    parser.add_argument("--hard3-curve-neighbors", type=int, default=12)
+    parser.add_argument("--hard3-curve-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-curve-weight-decay", type=float, default=1e-3)
+    parser.add_argument("--hard3-curve-grad-clip", type=float, default=1.0)
+    parser.add_argument("--hard3-curve-pretrain-epochs", type=int, default=20)
+    parser.add_argument("--hard3-curve-pretrain-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-curve-real-sample-fraction", type=float, default=0.5)
+    parser.add_argument("--hard3-curve-checkpoint-weight", type=float, default=0.05)
+    parser.add_argument("--hard3-curve-sigma-mm", type=float, default=2.0)
+    parser.add_argument("--hard3-curve-point-sigma-lm0", type=float, default=2.5)
+    parser.add_argument("--hard3-curve-point-sigma-gonion", type=float, default=3.0)
+    parser.add_argument("--hard3-curve-pseudo-weight", type=float, default=0.20)
+    parser.add_argument("--hard3-curve-bce-weight", type=float, default=0.75)
+    parser.add_argument("--hard3-curve-dice-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-distance-weight", type=float, default=0.20)
+    parser.add_argument("--hard3-curve-listwise-weight", type=float, default=1.0)
+    parser.add_argument("--hard3-curve-coordinate-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-clinical-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-bilateral-weight", type=float, default=0.10)
+    parser.add_argument("--hard3-curve-confidence-weight", type=float, default=0.05)
+    parser.add_argument("--hard3-curve-temperature", type=float, default=0.75)
+    parser.add_argument("--core20-mvsc", action="store_true")
+    parser.add_argument(
+        "--core20-mvsc-ablation", choices=("C1", "C2", "C3", "C4"), default="C4"
+    )
+    parser.add_argument("--core20-mvsc-folds", type=int, default=5)
+    parser.add_argument("--core20-mvsc-epochs", type=int, default=120)
+    parser.add_argument("--core20-mvsc-min-epochs", type=int, default=40)
+    parser.add_argument("--core20-mvsc-patience", type=int, default=25)
+    parser.add_argument("--core20-mvsc-batch-size", type=int, default=32)
+    parser.add_argument("--core20-mvsc-image-size", type=int, default=96)
+    parser.add_argument("--core20-mvsc-width", type=int, default=48)
+    parser.add_argument("--core20-mvsc-dropout", type=float, default=0.10)
+    parser.add_argument("--core20-mvsc-lr", type=float, default=3e-4)
+    parser.add_argument("--core20-mvsc-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--core20-mvsc-grad-clip", type=float, default=1.0)
+    parser.add_argument("--core20-mvsc-coordinate-topk", type=int, default=8)
+    parser.add_argument("--core20-mvsc-coordinate-temperature", type=float, default=0.5)
+    parser.add_argument("--core20-mvsc-color-noise", type=float, default=0.02)
+    parser.add_argument("--core20-mvsc-candidate-dropout", type=float, default=0.05)
+    parser.add_argument("--core20-mvsc-hard-negative-count", type=int, default=16)
+    parser.add_argument("--core20-mvsc-prior-l2-grid", default="0.1,1,10,100")
+    parser.add_argument("--core20-mvsc-target-ale", type=float, default=1.70)
+    parser.add_argument("--core20-mvsc-stretch-ale", type=float, default=1.647)
+    parser.add_argument(
+        "--core20-mvsc-min-improvement-probability", type=float, default=0.95
+    )
+    parser.add_argument(
+        "--core20-mvsc-max-group-regression-mm", type=float, default=0.10
+    )
+    parser.add_argument("--core20-mvsc-blend-grid", default="0,0.25,0.5,0.75,1")
+    parser.add_argument("--no-tta", dest="tta", action="store_false")
+    parser.add_argument(
+        "--no-tta-validation", dest="tta_validation", action="store_false"
+    )
+    return parser
+
+
+def vnext_signature(args, splits):
+    ignored = {
+        "output_dir",
+        "preprocessing_root",
+        "fold_indices",
+        "validation_only",
+        "preflight_only",
+        "no_tqdm",
+        "resume_stage2",
+        "force_stage2_retrain",
+        "checkpoint_every",
+    }
+    payload = {
+        "pipeline_version": 2,
+        "args": {
+            key: value
+            for key, value in vars(args).items()
+            if key not in ignored
+            and not key.startswith("hard3_")
+            and not key.startswith("core20_")
+            and isinstance(value, (str, int, float, bool, type(None)))
+        },
+        "splits": {name: list(values) for name, values in splits.items()},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def core20_config_from_args(args):
+    return Core20MVSCConfig(
+        enabled=args.core20_mvsc,
+        ablation=args.core20_mvsc_ablation,
+        folds=args.core20_mvsc_folds,
+        epochs=args.core20_mvsc_epochs,
+        min_epochs=args.core20_mvsc_min_epochs,
+        patience=args.core20_mvsc_patience,
+        batch_size=args.core20_mvsc_batch_size,
+        image_size=args.core20_mvsc_image_size,
+        width=args.core20_mvsc_width,
+        dropout=args.core20_mvsc_dropout,
+        lr=args.core20_mvsc_lr,
+        weight_decay=args.core20_mvsc_weight_decay,
+        grad_clip=args.core20_mvsc_grad_clip,
+        coordinate_topk=args.core20_mvsc_coordinate_topk,
+        coordinate_temperature=args.core20_mvsc_coordinate_temperature,
+        color_noise=args.core20_mvsc_color_noise,
+        candidate_dropout=args.core20_mvsc_candidate_dropout,
+        hard_negative_count=args.core20_mvsc_hard_negative_count,
+        prior_folds=args.core20_mvsc_folds,
+        prior_l2_grid=tuple(
+            float(value.strip())
+            for value in args.core20_mvsc_prior_l2_grid.split(",")
+            if value.strip()
+        ),
+        target_core20_ale=args.core20_mvsc_target_ale,
+        stretch_core20_ale=args.core20_mvsc_stretch_ale,
+        minimum_improvement_probability=(
+            args.core20_mvsc_min_improvement_probability
+        ),
+        maximum_group_regression_mm=(args.core20_mvsc_max_group_regression_mm),
+        blend_grid=tuple(
+            float(value.strip())
+            for value in args.core20_mvsc_blend_grid.split(",")
+            if value.strip()
+        ),
+        bootstrap_iters=args.bootstrap_iters,
+        mixed_precision=args.mixed_precision,
+        amp_dtype=args.amp_dtype,
+        seed=args.seed,
+    )
+
+
+def hard3_config_from_args(args):
+    return Hard3StructuredConfig(
+        folds=args.hard3_structured_folds,
+        epochs=args.hard3_structured_epochs,
+        min_epochs=args.hard3_structured_min_epochs,
+        patience=args.hard3_structured_patience,
+        batch_size=args.hard3_structured_batch_size,
+        width=args.hard3_structured_width,
+        dropout=args.hard3_structured_dropout,
+        pair_topk=args.hard3_structured_pair_topk,
+        lr=args.hard3_structured_lr,
+        weight_decay=args.hard3_structured_weight_decay,
+        grad_clip=args.hard3_structured_grad_clip,
+        sigma_lm0=args.hard3_structured_sigma_lm0,
+        sigma_gonion=args.hard3_structured_sigma_gonion,
+        coordinate_weight=args.hard3_structured_coordinate_weight,
+        negative_weight=args.hard3_structured_negative_weight,
+        negative_margin=args.hard3_structured_negative_margin,
+        feature_noise=args.hard3_structured_feature_noise,
+        maximum_step_lm0=args.hard3_structured_max_step_lm0,
+        maximum_step_gonion=args.hard3_structured_max_step_gonion,
+        bootstrap_iters=args.bootstrap_iters,
+        minimum_overall_gain_mm=args.hard3_structured_min_overall_gain_mm,
+        minimum_hard3_gain_mm=args.hard3_structured_min_hard3_gain_mm,
+        minimum_improvement_probability=args.hard3_structured_min_improvement_probability,
+        maximum_p95_regression_mm=args.hard3_structured_max_p95_regression_mm,
+        seed=args.seed,
+    )
+
+
+def hard3_dual_view_config_from_args(args):
+    return Hard3DualViewConfig(
+        folds=args.hard3_dual_view_folds,
+        epochs=args.hard3_dual_view_epochs,
+        min_epochs=args.hard3_dual_view_min_epochs,
+        patience=args.hard3_dual_view_patience,
+        batch_size=args.hard3_dual_view_batch_size,
+        image_size=args.hard3_dual_view_image_size,
+        width=args.hard3_dual_view_width,
+        dropout=args.hard3_dual_view_dropout,
+        radius_scale=args.hard3_dual_view_radius_scale,
+        translation_pixels=args.hard3_dual_view_translation_pixels,
+        color_noise=args.hard3_dual_view_color_noise,
+        lr=args.hard3_dual_view_lr,
+        weight_decay=args.hard3_dual_view_weight_decay,
+        grad_clip=args.hard3_dual_view_grad_clip,
+        sigma_lm0=args.hard3_dual_view_sigma_lm0,
+        sigma_gonion=args.hard3_dual_view_sigma_gonion,
+        heatmap_weight=args.hard3_dual_view_heatmap_weight,
+        poss_weight=args.hard3_dual_view_poss_weight,
+        poss_exponent=args.hard3_dual_view_poss_exponent,
+        poss_temperature=args.hard3_dual_view_poss_temperature,
+        ranking_weight=args.hard3_dual_view_ranking_weight,
+        coordinate_weight=args.hard3_dual_view_coordinate_weight,
+        pair_weight=args.hard3_dual_view_pair_weight,
+        joint_pair_weight=args.hard3_dual_view_joint_pair_weight,
+        joint_pair_negative_weight=args.hard3_dual_view_joint_pair_negative_weight,
+        decoder_mode=args.hard3_dual_view_decoder_mode,
+        proposal_topk=args.hard3_dual_view_proposal_topk,
+        pair_topk=args.hard3_dual_view_pair_topk,
+        pair_temperature=args.hard3_dual_view_pair_temperature,
+        proposal_neighbors=args.hard3_dual_view_proposal_neighbors,
+        proposal_teacher_forcing_epochs=args.hard3_dual_view_teacher_forcing_epochs,
+        rerank_sigma=args.hard3_dual_view_rerank_sigma,
+        rerank_temperature=args.hard3_dual_view_rerank_temperature,
+        rerank_expected_distance_weight=(
+            args.hard3_dual_view_rerank_expected_distance_weight
+        ),
+        rerank_ordinal_weight=args.hard3_dual_view_rerank_ordinal_weight,
+        rerank_negative_radius_mm=(args.hard3_dual_view_rerank_negative_radius_mm),
+        rerank_stage_epochs=args.hard3_dual_view_rerank_stage_epochs,
+        rerank_stage_min_epochs=args.hard3_dual_view_rerank_stage_min_epochs,
+        rerank_stage_patience=args.hard3_dual_view_rerank_stage_patience,
+        rerank_stage_lr=args.hard3_dual_view_rerank_stage_lr,
+        pair_stage_epochs=args.hard3_dual_view_pair_stage_epochs,
+        pair_stage_min_epochs=args.hard3_dual_view_pair_stage_min_epochs,
+        pair_stage_patience=args.hard3_dual_view_pair_stage_patience,
+        pair_stage_lr=args.hard3_dual_view_pair_stage_lr,
+        pair_target_sigma=args.hard3_dual_view_pair_target_sigma,
+        pair_listwise_weight=args.hard3_dual_view_pair_listwise_weight,
+        pair_unary_listwise_weight=(args.hard3_dual_view_pair_unary_listwise_weight),
+        pair_clinical_radius_mm=args.hard3_dual_view_pair_clinical_radius_mm,
+        pair_clinical_mass_weight=args.hard3_dual_view_pair_clinical_mass_weight,
+        pair_expected_distance_weight=(
+            args.hard3_dual_view_pair_expected_distance_weight
+        ),
+        pair_hard_negative_weight=(args.hard3_dual_view_pair_hard_negative_weight),
+        pair_hard_negative_radius_mm=(
+            args.hard3_dual_view_pair_hard_negative_radius_mm
+        ),
+        pair_hard_negative_count=args.hard3_dual_view_pair_hard_negative_count,
+        pair_validation_mode=args.hard3_dual_view_pair_validation_mode,
+        contour_state_weight=args.hard3_dual_view_contour_state_weight,
+        contour_moment_weight=args.hard3_dual_view_contour_moment_weight,
+        contour_state_scale=args.hard3_dual_view_contour_state_scale,
+        contour_residual_limit=args.hard3_dual_view_contour_residual_limit,
+        statistical_l2_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_statistical_l2_grid.split(",")
+            if value.strip()
+        ),
+        statistical_shortlist_grid=tuple(
+            int(value.strip())
+            for value in args.hard3_dual_view_statistical_shortlist_grid.split(",")
+            if value.strip()
+        ),
+        statistical_contour_weight_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_statistical_contour_weight_grid.split(",")
+            if value.strip()
+        ),
+        statistical_state_weight_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_statistical_state_weight_grid.split(",")
+            if value.strip()
+        ),
+        interaction_shortlist=args.hard3_dual_view_interaction_shortlist,
+        interaction_width=args.hard3_dual_view_interaction_width,
+        interaction_dropout=args.hard3_dual_view_interaction_dropout,
+        interaction_epochs=args.hard3_dual_view_interaction_epochs,
+        interaction_min_epochs=args.hard3_dual_view_interaction_min_epochs,
+        interaction_patience=args.hard3_dual_view_interaction_patience,
+        interaction_lr=args.hard3_dual_view_interaction_lr,
+        interaction_weight_decay=args.hard3_dual_view_interaction_weight_decay,
+        interaction_sigma=args.hard3_dual_view_interaction_sigma,
+        interaction_expected_distance_weight=(
+            args.hard3_dual_view_interaction_expected_distance_weight
+        ),
+        interaction_coordinate_weight=(
+            args.hard3_dual_view_interaction_coordinate_weight
+        ),
+        interaction_pair_weight=args.hard3_dual_view_interaction_pair_weight,
+        interaction_hard_negative_weight=(
+            args.hard3_dual_view_interaction_hard_negative_weight
+        ),
+        interaction_negative_radius_mm=(
+            args.hard3_dual_view_interaction_negative_radius_mm
+        ),
+        interaction_negative_margin=(args.hard3_dual_view_interaction_negative_margin),
+        set_shortlist=args.hard3_dual_view_set_shortlist,
+        set_width=args.hard3_dual_view_set_width,
+        set_dropout=args.hard3_dual_view_set_dropout,
+        set_candidate_dropout=args.hard3_dual_view_set_candidate_dropout,
+        set_epochs=args.hard3_dual_view_set_epochs,
+        set_min_epochs=args.hard3_dual_view_set_min_epochs,
+        set_patience=args.hard3_dual_view_set_patience,
+        set_lr=args.hard3_dual_view_set_lr,
+        set_weight_decay=args.hard3_dual_view_set_weight_decay,
+        set_sigma=args.hard3_dual_view_set_sigma,
+        set_expected_distance_weight=(
+            args.hard3_dual_view_set_expected_distance_weight
+        ),
+        set_coordinate_weight=args.hard3_dual_view_set_coordinate_weight,
+        set_pair_weight=args.hard3_dual_view_set_pair_weight,
+        set_clinical_mass_weight=args.hard3_dual_view_set_clinical_mass_weight,
+        set_hard_negative_weight=args.hard3_dual_view_set_hard_negative_weight,
+        set_negative_radius_mm=args.hard3_dual_view_set_negative_radius_mm,
+        set_negative_margin=args.hard3_dual_view_set_negative_margin,
+        multiscale_shortlist=args.hard3_dual_view_multiscale_shortlist,
+        multiscale_hops=tuple(
+            int(value.strip())
+            for value in args.hard3_dual_view_multiscale_hops.split(",")
+            if value.strip()
+        ),
+        multiscale_feature_modes=tuple(
+            value.strip()
+            for value in args.hard3_dual_view_multiscale_feature_modes.split(",")
+            if value.strip()
+        ),
+        multiscale_l2_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_multiscale_l2_grid.split(",")
+            if value.strip()
+        ),
+        multiscale_descriptor_weight_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_multiscale_descriptor_weight_grid.split(
+                ","
+            )
+            if value.strip()
+        ),
+        mixture_shortlist=args.hard3_dual_view_mixture_shortlist,
+        mixture_feature_modes=tuple(
+            value.strip()
+            for value in args.hard3_dual_view_mixture_feature_modes.split(",")
+            if value.strip()
+        ),
+        mixture_l2_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_mixture_l2_grid.split(",")
+            if value.strip()
+        ),
+        mixture_alpha_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_mixture_alpha_grid.split(",")
+            if value.strip()
+        ),
+        negative_weight=args.hard3_dual_view_negative_weight,
+        gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
+        atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
+        atlas_temperature=args.hard3_dual_view_atlas_temperature,
+        final_ensemble_members=args.hard3_dual_view_final_members,
+        final_model_policy=args.hard3_dual_view_final_policy,
+        diagnostic_topk=tuple(
+            int(value.strip())
+            for value in args.hard3_dual_view_diagnostic_topk.split(",")
+            if value.strip()
+        ),
+        minimum_proposal_recall=args.hard3_dual_view_min_proposal_recall,
+        maximum_proposal_oracle_ale=args.hard3_dual_view_max_proposal_oracle_ale,
+        minimum_proposal_sdr2=args.hard3_dual_view_min_proposal_sdr2,
+        maximum_proposal_oracle_p95=args.hard3_dual_view_max_proposal_oracle_p95,
+        maximum_step_lm0=args.hard3_structured_max_step_lm0,
+        maximum_step_gonion=args.hard3_structured_max_step_gonion,
+        bootstrap_iters=args.bootstrap_iters,
+        minimum_overall_gain_mm=args.hard3_structured_min_overall_gain_mm,
+        minimum_hard3_gain_mm=args.hard3_structured_min_hard3_gain_mm,
+        minimum_improvement_probability=args.hard3_structured_min_improvement_probability,
+        maximum_p95_regression_mm=args.hard3_structured_max_p95_regression_mm,
+        target_hard3_ale=args.hard3_dual_view_target_ale,
+        seed=args.seed,
+    )
+
+
+def hard3_curve_config_from_args(args):
+    return CurveHard3Config(
+        run_mode=args.hard3_curve_run_mode,
+        folds=args.hard3_curve_folds,
+        epochs=args.hard3_curve_epochs,
+        min_epochs=args.hard3_curve_min_epochs,
+        patience=args.hard3_curve_patience,
+        batch_size=args.hard3_curve_batch_size,
+        image_size=args.hard3_curve_image_size,
+        width=args.hard3_curve_width,
+        blocks=args.hard3_curve_blocks,
+        dropout=args.hard3_curve_dropout,
+        radius_scale=args.hard3_curve_radius_scale,
+        neighbor_count=args.hard3_curve_neighbors,
+        lr=args.hard3_curve_lr,
+        weight_decay=args.hard3_curve_weight_decay,
+        grad_clip=args.hard3_curve_grad_clip,
+        curve_pretrain_epochs=args.hard3_curve_pretrain_epochs,
+        curve_pretrain_lr=args.hard3_curve_pretrain_lr,
+        real_sample_fraction=args.hard3_curve_real_sample_fraction,
+        curve_checkpoint_weight=args.hard3_curve_checkpoint_weight,
+        curve_sigma_mm=args.hard3_curve_sigma_mm,
+        point_sigma_lm0_mm=args.hard3_curve_point_sigma_lm0,
+        point_sigma_gonion_mm=args.hard3_curve_point_sigma_gonion,
+        pseudo_curve_weight=args.hard3_curve_pseudo_weight,
+        curve_bce_weight=args.hard3_curve_bce_weight,
+        curve_dice_weight=args.hard3_curve_dice_weight,
+        curve_distance_weight=args.hard3_curve_distance_weight,
+        listwise_weight=args.hard3_curve_listwise_weight,
+        coordinate_weight=args.hard3_curve_coordinate_weight,
+        clinical_weight=args.hard3_curve_clinical_weight,
+        bilateral_weight=args.hard3_curve_bilateral_weight,
+        confidence_weight=args.hard3_curve_confidence_weight,
+        temperature=args.hard3_curve_temperature,
+        annotation_manifest=args.hard3_curve_annotation_manifest,
+        minimum_annotated_samples=args.hard3_curve_min_annotated_samples,
+        publication_minimum_annotated_samples=(
+            args.hard3_curve_publication_min_annotated_samples
+        ),
+        maximum_annotation_surface_distance_mm=(
+            args.hard3_curve_max_annotation_surface_distance_mm
+        ),
+        maximum_landmark_curve_distance_mm=(
+            args.hard3_curve_max_landmark_curve_distance_mm
+        ),
+        allow_pseudo_curves=args.hard3_curve_allow_pseudo,
+        maximum_step_lm0=args.hard3_structured_max_step_lm0,
+        maximum_step_gonion=args.hard3_structured_max_step_gonion,
+        bootstrap_iters=args.bootstrap_iters,
+        minimum_overall_gain_mm=args.hard3_structured_min_overall_gain_mm,
+        minimum_hard3_gain_mm=args.hard3_structured_min_hard3_gain_mm,
+        minimum_improvement_probability=(
+            args.hard3_structured_min_improvement_probability
+        ),
+        maximum_p95_regression_mm=args.hard3_structured_max_p95_regression_mm,
+        target_hard3_ale=args.hard3_dual_view_target_ale,
+        seed=args.seed,
+    )
+
+
+def hard3_dual_view_revision(args):
+    mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
+    if mode == "crossfit_mixture_state":
+        return "hard3_dual_view_v13", 14
+    if mode == "crossfit_global_contour":
+        return "hard3_dual_view_v12", 13
+    if mode == "crossfit_multiscale_contour":
+        return "hard3_dual_view_v11", 12
+    if mode == "crossfit_set_context":
+        return "hard3_dual_view_v10", 11
+    if mode == "crossfit_interaction":
+        return "hard3_dual_view_v9", 10
+    if mode == "crossfit_calibrated":
+        return "hard3_dual_view_v8", 9
+    if mode == "contour_coordinate":
+        return "hard3_dual_view_v7", 8
+    if mode == "full_pair":
+        return "hard3_dual_view_v6", 7
+    return "hard3_dual_view_v5", 6
+
+
+def hard3_artifact_contract(args):
+    mode = getattr(args, "hard3_refiner_mode", "structured")
+    if mode == "dual_view":
+        name, version = hard3_dual_view_revision(args)
+        return name, version, "hard3_dual_view_model.pth"
+    if mode == "curve_supervised":
+        return "curve_supervised_hard3_v2", 16, "curve_hard3_model.pth"
+    return "hard3_structured", 2, "hard3_structured_model.pth"
+
+
+def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
+    baseline_overall = float(baseline_metrics["overall"]["ale"])
+    baseline_hard3 = float(baseline_metrics["hard3"]["ale"])
+    final_overall = float(final_metrics["overall"]["ale"])
+    final_core20 = float(final_metrics["core20"]["ale"])
+    final_hard3 = float(final_metrics["hard3"]["ale"])
+    required_hard3 = (23.0 * 2.0 - 20.0 * final_core20) / 3.0
+    checks = {
+        "validation_blend_accepted": bool(
+            hard3_report.get("blend", {}).get("accepted", False)
+        ),
+        "overall_at_or_below_full_cv_gate": bool(
+            final_overall <= args.hard3_stage3_full_cv_max_overall
+        ),
+        "hard3_at_or_below_full_cv_gate": bool(
+            final_hard3 < args.hard3_stage3_full_cv_max_hard3
+        ),
+        "hard3_validation_target_reached": bool(
+            hard3_report.get("blend", {}).get(
+                "target_reached_on_validation",
+                final_hard3 < args.hard3_stage3_full_cv_max_hard3,
+            )
+        ),
+        "core20_unchanged_by_stage3": bool(
+            abs(final_core20 - float(baseline_metrics["core20"]["ale"])) <= 1e-6
+        ),
+    }
+    proposal_gate = {"applied": False}
+    if hard3_report.get("mode") == "dual_view":
+        oof = hard3_report.get("training", {}).get("oof", {})
+        gate_values = oof.get("gonion_pair_topk_recall", {})
+        gate_scope = "outer_train_oof"
+        if getattr(args, "hard3_dual_view_decoder_mode", "") in (
+            "crossfit_mixture_state",
+            "crossfit_global_contour",
+            "crossfit_multiscale_contour",
+            "crossfit_calibrated",
+            "crossfit_interaction",
+            "crossfit_set_context",
+        ):
+            validation_diagnostics = hard3_report.get(
+                "validation_candidate_diagnostics", {}
+            )
+            selector_diagnostics = validation_diagnostics.get("crossfit_selector", {})
+            selector_policy = oof.get("crossfit_selector", {}).get("selected", {})
+            selector_topk = int(
+                selector_policy.get("shortlist", args.hard3_dual_view_pair_topk)
+            )
+            proposal_row = (
+                validation_diagnostics.get("proposal", {})
+                .get("at_k", {})
+                .get(str(selector_topk))
+            )
+            oracle_row = selector_diagnostics.get("shortlist_oracle")
+            if proposal_row is not None and oracle_row is not None:
+                gate_values = {
+                    "topk": selector_topk,
+                    "lm21": proposal_row["lm21_recall"],
+                    "lm22": proposal_row["lm22_recall"],
+                    "both": proposal_row["both_recall"],
+                    "oracle_ale": oracle_row["ale"],
+                    "oracle_p95": oracle_row["p95"],
+                    "oracle_sdr_at_2mm": oracle_row["sdr_at_2mm"],
+                    "clinical_both_coverage": oracle_row["both_within_2mm"],
+                }
+                gate_scope = "outer_validation_locked_shortlist"
+        gate_topk = int(gate_values.get("topk", args.hard3_dual_view_pair_topk))
+        lm21_recall = float(gate_values.get("lm21", 0.0))
+        lm22_recall = float(gate_values.get("lm22", 0.0))
+        proposal_oracle = float(gate_values.get("oracle_ale", float("inf")))
+        proposal_p95 = float(gate_values.get("oracle_p95", float("inf")))
+        proposal_sdr2 = float(gate_values.get("oracle_sdr_at_2mm", 0.0))
+        clinical_both = float(gate_values.get("clinical_both_coverage", 0.0))
+        checks.update(
+            {
+                "proposal_oracle_at_or_below_gate": bool(
+                    proposal_oracle <= args.hard3_dual_view_max_proposal_oracle_ale
+                ),
+                "proposal_oracle_p95_at_or_below_gate": bool(
+                    proposal_p95 <= args.hard3_dual_view_max_proposal_oracle_p95
+                ),
+                "proposal_oracle_sdr2_at_or_above_gate": bool(
+                    proposal_sdr2 >= args.hard3_dual_view_min_proposal_sdr2
+                ),
+            }
+        )
+        proposal_gate = {
+            "applied": True,
+            "scope": gate_scope,
+            "source": {
+                "crossfit_mixture_state": "OOF_coordinate_mixture_state_search",
+                "crossfit_global_contour": "OOF_global_jaw_contour_search",
+                "crossfit_multiscale_contour": "OOF_multiscale_contour_search",
+                "crossfit_set_context": "OOF_relational_set_context_search",
+                "crossfit_interaction": "OOF_subjectwise_interaction_search",
+                "crossfit_calibrated": "OOF_calibrated_contour_search",
+                "contour_coordinate": "shape_conditioned_contour_search",
+                "full_pair": "recall_preserving_full_pair_search",
+                "sharp_pruned": "sharp_reranked_pair_shortlist",
+            }.get(
+                getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned"),
+                "unknown",
+            ),
+            "topk": gate_topk,
+            "lm21_recall": lm21_recall,
+            "lm22_recall": lm22_recall,
+            "both_recall": float(gate_values.get("both", 0.0)),
+            "gonion_oracle_ale": proposal_oracle,
+            "gonion_oracle_p95": proposal_p95,
+            "gonion_oracle_sdr_at_2mm": proposal_sdr2,
+            "clinical_both_coverage": clinical_both,
+            "informational_exact_recall_reference": (
+                args.hard3_dual_view_min_proposal_recall
+            ),
+            "maximum_oracle_ale": args.hard3_dual_view_max_proposal_oracle_ale,
+            "maximum_oracle_p95": args.hard3_dual_view_max_proposal_oracle_p95,
+            "minimum_oracle_sdr_at_2mm": args.hard3_dual_view_min_proposal_sdr2,
+        }
+    elif hard3_report.get("mode") == "curve_supervised":
+        candidate_oracle = hard3_report.get("validation_candidate_diagnostics", {}).get(
+            "candidate_oracle", {}
+        )
+        proposal_oracle = float(candidate_oracle.get("hard3_ale", float("inf")))
+        proposal_p95 = float(candidate_oracle.get("hard3_p95", float("inf")))
+        proposal_sdr2 = float(candidate_oracle.get("hard3_sdr_at_2mm", 0.0))
+        publication_ready = bool(
+            hard3_report.get("training", {}).get("publication_ready", False)
+        )
+        checks.update(
+            {
+                "curve_annotations_publication_ready": publication_ready,
+                "proposal_oracle_at_or_below_gate": bool(
+                    proposal_oracle <= args.hard3_dual_view_max_proposal_oracle_ale
+                ),
+                "proposal_oracle_p95_at_or_below_gate": bool(
+                    proposal_p95 <= args.hard3_dual_view_max_proposal_oracle_p95
+                ),
+                "proposal_oracle_sdr2_at_or_above_gate": bool(
+                    proposal_sdr2 >= args.hard3_dual_view_min_proposal_sdr2
+                ),
+            }
+        )
+        proposal_gate = {
+            "applied": True,
+            "scope": "outer_validation_curve_candidate_set",
+            "source": "curve_support_candidate_search",
+            "topk": None,
+            "lm21_recall": None,
+            "lm22_recall": None,
+            "both_recall": None,
+            "gonion_oracle_ale": proposal_oracle,
+            "gonion_oracle_p95": proposal_p95,
+            "gonion_oracle_sdr_at_2mm": proposal_sdr2,
+            "clinical_both_coverage": None,
+            "publication_ready": publication_ready,
+            "maximum_oracle_ale": args.hard3_dual_view_max_proposal_oracle_ale,
+            "maximum_oracle_p95": args.hard3_dual_view_max_proposal_oracle_p95,
+            "minimum_oracle_sdr_at_2mm": args.hard3_dual_view_min_proposal_sdr2,
+        }
+    return {
+        "baseline": {
+            "overall_ale": baseline_overall,
+            "core20_ale": float(baseline_metrics["core20"]["ale"]),
+            "hard3_ale": baseline_hard3,
+            "p95": float(baseline_metrics["overall"]["p95"]),
+        },
+        "candidate": {
+            "overall_ale": final_overall,
+            "core20_ale": final_core20,
+            "hard3_ale": final_hard3,
+            "p95": float(final_metrics["overall"]["p95"]),
+        },
+        "gains": {
+            "overall_mm": baseline_overall - final_overall,
+            "hard3_mm": baseline_hard3 - final_hard3,
+        },
+        "two_mm_budget": {
+            "required_hard3_ale_at_current_core20": required_hard3,
+            "remaining_hard3_gap_mm": final_hard3 - required_hard3,
+            "target_reached": bool(final_overall < 2.0),
+        },
+        "proposal_gate": proposal_gate,
+        "checks": checks,
+        "run_full_cv": bool(all(checks.values())),
+        "test_labels_consumed": False,
+    }
+
+
+def train_shapes_from_dataset(dataset):
+    shapes = []
+    sample_ids = []
+    for sample in dataset.samples:
+        with np.load(dataset.records[sample.sample_id]) as record:
+            if "landmarks" not in record.files:
+                raise RuntimeError(
+                    f"Outer-train record has no landmarks: {sample.sample_id}"
+                )
+            shapes.append(record["landmarks"].astype(np.float32))
+        sample_ids.append(sample.sample_id)
+    return np.stack(shapes), sample_ids
+
+
+def apply_shape_prior(outputs, prior):
+    result = dict(outputs)
+    result["neural_prediction"] = outputs["prediction"].copy()
+    prediction = prior.transform(outputs["prediction"])
+    result["prediction"] = prediction
+    result["errors"] = np.linalg.norm(prediction - outputs["expert"], axis=-1)
+    return result
+
+
+def fit_shape_prior(args, dataset, validation, fold_dir):
+    if not args.shape_prior:
+        return None, {"enabled": False, "reason": "disabled_by_argument"}
+    train_shapes, train_ids = train_shapes_from_dataset(dataset)
+    prior = TrainOnlyShapePrior(
+        component_grid=[
+            int(value)
+            for value in args.shape_prior_components.split(",")
+            if value.strip()
+        ],
+        l2_grid=[
+            float(value) for value in args.shape_prior_l2.split(",") if value.strip()
+        ],
+    ).fit(train_shapes, train_ids)
+    selected = prior.calibrate(
+        validation["prediction"],
+        validation["expert"],
+        validation["sample_ids"],
+        args.shape_prior_max_core_regression_mm,
+    )
+    base_ale = float(validation["errors"].mean())
+    candidate = prior.transform(validation["prediction"])
+    candidate_ale = float(
+        np.linalg.norm(candidate - validation["expert"], axis=-1).mean()
+    )
+    gain = base_ale - candidate_ale
+    accepted = gain >= float(args.shape_prior_min_val_gain_mm)
+    if not accepted:
+        prior.config = {
+            **selected,
+            "alpha_core": 0.0,
+            "alpha_hard": 0.0,
+            "validation_rejected": True,
+        }
+    report = {
+        "enabled": True,
+        "accepted": accepted,
+        "base_validation_ale": base_ale,
+        "candidate_validation_ale": candidate_ale,
+        "validation_gain_mm": gain,
+        "minimum_gain_mm": float(args.shape_prior_min_val_gain_mm),
+        "selected": prior.config,
+        "fit_sample_count": len(train_ids),
+        "fit_sample_ids": train_ids,
+        "validation_sample_ids": list(validation["sample_ids"]),
+        "uses_test_labels": False,
+    }
+    prior.save(Path(fold_dir) / "shape_prior_full_report.json")
+    write_csv(
+        Path(fold_dir) / "shape_prior_validation_sweep.csv",
+        prior.calibration_rows,
+    )
+    (Path(fold_dir) / "shape_prior_selection.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
+    return prior, report
+
+
+def collect_training_cascade_outputs(
+    dataset,
+    model,
+    device,
+    args,
+    normalizer,
+    force_refined,
+    refinement_calibration,
+    shape_prior,
+):
+    """Recreate the inference cascade on train samples for Stage 3 centers."""
+    evaluation_dataset = copy.copy(dataset)
+    evaluation_dataset.training = False
+    loader = make_loader(
+        evaluation_dataset,
+        args.eval_batch_size,
+        False,
+        args,
+    )
+    outputs = collect_outputs(
+        model,
+        loader,
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta_validation,
+        force_refined=force_refined,
+    )
+    outputs = apply_refinement_calibration(outputs, refinement_calibration)
+    if shape_prior is not None:
+        outputs = apply_shape_prior(outputs, shape_prior)
+    return outputs
+
+
+def model_from_args(args, normalizer, device):
+    return AGHFormerVNext(
+        input_dim=len(normalizer["mean"]),
+        width=args.width,
+        global_blocks=args.global_blocks,
+        heads=args.heads,
+        dropout=args.dropout,
+        coordinate_topk=args.coordinate_topk,
+        coordinate_temperature=args.coordinate_temperature,
+        use_anatomical_attention=True,
+        use_specialized_heads=True,
+        use_local_refiner=True,
+        use_refinement_gate=True,
+        use_hard_candidate_ranker=True,
+        use_e10_rankers=True,
+        hard_coordinate_topk=args.hard_coordinate_topk,
+        hard_coordinate_temperature=args.hard_coordinate_temperature,
+        gonion_pair_topk=args.gonion_pair_topk,
+        roi_radius_scale=args.roi_radius_scale,
+        token_blocks=args.token_blocks,
+        token_surface_points=args.token_surface_points,
+        fusion_residual_limit_mm=args.fusion_residual_limit_mm,
+        fusion_hard_residual_limit_mm=args.fusion_hard_residual_limit_mm,
+    ).to(device)
+
+
+def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
+    fold_dir = Path(fold_dir)
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    args.stage2_signature = vnext_signature(args, splits)
+    datasets, normalizer = prepare_fold(
+        samples,
+        splits,
+        args,
+        fold_dir,
+        device,
+        preprocessing_dir=preprocessing_dir,
+    )
+    loaders = {
+        "train": make_loader(datasets["train"], args.batch_size, True, args),
+        "val": make_loader(datasets["val"], args.eval_batch_size, False, args),
+        "test": make_loader(datasets["test"], args.eval_batch_size, False, args),
+    }
+    model = model_from_args(args, normalizer, device)
+    model.set_refinement_gate_trainable(False)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    hard3_parameter_count = 0
+    core20_parameter_count = 0
+    print(f"AGH-Former vNext parameters: {parameter_count:,}", flush=True)
+    loss_weights = LossWeights(
+        heatmap=args.heatmap_weight,
+        region=args.region_weight,
+        coordinate=args.coordinate_weight,
+        coarse=args.coarse_weight,
+        anatomy=args.anatomy_weight,
+        symmetry=args.symmetry_weight,
+        uncertainty=args.uncertainty_weight,
+        clinical=args.clinical_weight,
+        gate=args.gate_weight,
+        hard_landmark=args.hard_landmark_weight,
+        hard_rank=args.hard_rank_weight,
+    )
+    training = fit_model(
+        model,
+        loaders["train"],
+        loaders["val"],
+        device,
+        args,
+        loss_weights,
+        normalizer,
+        fold_dir,
+    )
+    if training["best_validation_ale"] > args.max_stage2_val_ale:
+        raise RuntimeError(
+            f"Stage 2 validation ALE={training['best_validation_ale']:.4f} exceeds "
+            f"--max-stage2-val-ale={args.max_stage2_val_ale:.4f}; test remains sealed."
+        )
+    gate_training = fit_separate_refinement_gate(
+        model,
+        loaders["train"],
+        loaders["val"],
+        device,
+        args,
+        normalizer,
+        fold_dir,
+    )
+    training["separate_gate"] = gate_training
+    force_refined = not gate_training["accepted"]
+    validation = collect_outputs(
+        model,
+        loaders["val"],
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta_validation,
+        force_refined=force_refined,
+    )
+    refinement_calibration = fit_refinement_calibration(
+        validation, args.refinement_calibration
+    )
+    validation = apply_refinement_calibration(validation, refinement_calibration)
+    neural_calibration = calibrate_confidence(
+        validation["log_var"], validation["errors"]
+    )
+    neural_validation_metrics = save_evaluation(
+        fold_dir / "neural_only",
+        "val",
+        validation,
+        neural_calibration,
+        args.bootstrap_iters,
+        args.seed,
+    )
+    prior, prior_report = fit_shape_prior(args, datasets["train"], validation, fold_dir)
+    if prior is not None:
+        validation = apply_shape_prior(validation, prior)
+    shape_prior_calibration = calibrate_confidence(
+        validation["log_var"], validation["errors"]
+    )
+    shape_prior_validation_metrics = save_evaluation(
+        fold_dir / "shape_prior_only",
+        "val",
+        validation,
+        shape_prior_calibration,
+        args.bootstrap_iters,
+        args.seed,
+    )
+    hard3_refiner = None
+    hard3_policy = None
+    hard3_apply = None
+    hard3_output_dir = None
+    hard3_report = {"enabled": False, "reason": "disabled_by_argument"}
+    if args.hard3_structured:
+        if args.hard3_refiner_mode == "dual_view":
+            hard3_name, _ = hard3_dual_view_revision(args)
+            hard3_output_dir = fold_dir / hard3_name
+            hard3_config = hard3_dual_view_config_from_args(args)
+            hard3_training_baseline = None
+            if hard3_config.decoder_mode == "contour_coordinate":
+                print(
+                    "Collecting train-fold Stage 2 + shape-prior centers for Hard3...",
+                    flush=True,
+                )
+                hard3_training_baseline = collect_training_cascade_outputs(
+                    datasets["train"],
+                    model,
+                    device,
+                    args,
+                    normalizer,
+                    force_refined,
+                    refinement_calibration,
+                    prior,
+                )
+            elif hard3_config.decoder_mode in (
+                "crossfit_mixture_state",
+                "crossfit_global_contour",
+                "crossfit_multiscale_contour",
+                "crossfit_calibrated",
+                "crossfit_interaction",
+                "crossfit_set_context",
+            ):
+                print(
+                    "Hard3 cross-fitted selector uses dataset-provided upstream coarse centers "
+                    "(Stage 1 OOF in the publication preset); the statistical "
+                    "selector excludes local center coordinates.",
+                    flush=True,
+                )
+            hard3_refiner = fit_or_load_dual_view_refiner(
+                datasets["train"],
+                hard3_output_dir,
+                hard3_config,
+                device,
+                training_baseline_outputs=hard3_training_baseline,
+            )
+            hard3_validation = hard3_refiner.predict(
+                datasets["val"], validation, "Hard3 validation dual-view patches"
+            )
+            if hard3_config.decoder_mode in (
+                "crossfit_mixture_state",
+                "crossfit_global_contour",
+                "crossfit_multiscale_contour",
+                "crossfit_calibrated",
+                "crossfit_interaction",
+                "crossfit_set_context",
+            ):
+                selector_diagnostics = hard3_validation["validation_diagnostics"][
+                    "crossfit_selector"
+                ]
+                oracle = selector_diagnostics["shortlist_oracle"]
+                selected = selector_diagnostics["selected"]
+                print(
+                    f"{hard3_refiner.report['version']} outer-validation selector: "
+                    f"ALE={selected['ale']:.4f} "
+                    f"shortlist_oracle={oracle['ale']:.4f} "
+                    f"p95={oracle['p95']:.4f} "
+                    f"SDR2={oracle['sdr_at_2mm']:.3f}",
+                    flush=True,
+                )
+            hard3_policy = calibrate_dual_view_blend(
+                validation, hard3_validation, hard3_config
+            )
+            hard3_apply = apply_dual_view_blend
+        elif args.hard3_refiner_mode == "curve_supervised":
+            hard3_name, _, _ = hard3_artifact_contract(args)
+            hard3_output_dir = fold_dir / hard3_name
+            hard3_config = hard3_curve_config_from_args(args)
+            if hard3_config.run_mode == "pseudo":
+                print(
+                    "Curve-H3 is running in pseudo-curve development mode; "
+                    "this result is not publication-ready.",
+                    flush=True,
+                )
+            hard3_refiner = fit_or_load_curve_hard3_refiner(
+                datasets["train"], hard3_output_dir, hard3_config, device
+            )
+            hard3_validation = hard3_refiner.predict(
+                datasets["val"], validation, "Curve-H3 validation patches"
+            )
+            hard3_policy = calibrate_dual_view_blend(
+                validation, hard3_validation, hard3_config
+            )
+            hard3_apply = apply_dual_view_blend
+        else:
+            hard3_output_dir = fold_dir / "hard3_structured"
+            hard3_config = hard3_config_from_args(args)
+            hard3_refiner = fit_or_load_hard3_refiner(
+                datasets["train"], hard3_output_dir, hard3_config, device
+            )
+            hard3_validation = hard3_refiner.predict(
+                datasets["val"], "Hard3 validation descriptors"
+            )
+            hard3_policy = calibrate_hard3_blend(
+                validation, hard3_validation, hard3_config
+            )
+            hard3_apply = apply_hard3_blend
+        hard3_parameter_count = int(
+            hard3_refiner.report["parameter_count_per_member"]
+            * hard3_refiner.report["ensemble_members"]
+        )
+        (hard3_output_dir / "hard3_blend_selection.json").write_text(
+            json.dumps(hard3_policy, indent=2), encoding="utf-8"
+        )
+        validation = hard3_apply(validation, hard3_validation, hard3_policy)
+        hard3_calibration = calibrate_confidence(
+            validation["log_var"], validation["errors"]
+        )
+        hard3_validation_metrics = save_evaluation(
+            hard3_output_dir,
+            "val",
+            validation,
+            hard3_calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        hard3_report = {
+            "enabled": True,
+            "mode": args.hard3_refiner_mode,
+            "training": hard3_refiner.report,
+            "blend": hard3_policy,
+            "validation": hard3_validation_metrics,
+            "validation_candidate_diagnostics": hard3_validation.get(
+                "validation_diagnostics", {}
+            ),
+        }
+        print(
+            f"Hard3 {args.hard3_refiner_mode} refinement: "
+            f"accepted={hard3_policy['accepted']} "
+            f"mode={hard3_policy['selected']['confidence_mode']} "
+            f"alpha=({hard3_policy['selected']['alpha_lm0']:.2f},"
+            f"{hard3_policy['selected'].get('alpha_gonion_left', hard3_policy['selected']['alpha_gonion']):.2f},"
+            f"{hard3_policy['selected'].get('alpha_gonion_right', hard3_policy['selected']['alpha_gonion']):.2f}) "
+            f"hard3={hard3_policy['base_hard3']['ale']:.4f}->"
+            f"{hard3_policy['blended_hard3']['ale']:.4f} "
+            f"overall_gain={hard3_policy['overall_gain_mm']:.4f} "
+            f"target4={hard3_policy.get('target_reached_on_validation', False)} "
+            f"candidate=({hard3_policy['selected'].get('lm0_variant', 'legacy')},"
+            f"{hard3_policy['selected'].get('gonion_variant', 'legacy')})",
+            flush=True,
+        )
+    calibration = calibrate_confidence(validation["log_var"], validation["errors"])
+    validation_metrics = save_evaluation(
+        fold_dir,
+        "val",
+        validation,
+        calibration,
+        args.bootstrap_iters,
+        args.seed,
+    )
+    stage3_decision = build_stage3_decision(
+        args,
+        shape_prior_validation_metrics,
+        validation_metrics,
+        hard3_report,
+    )
+    (fold_dir / "hard3_stage3_decision.json").write_text(
+        json.dumps(stage3_decision, indent=2), encoding="utf-8"
+    )
+    print(
+        "Hard3 Stage 3 decision: "
+        f"run_full_cv={stage3_decision['run_full_cv']} "
+        f"required_hard3_for_2mm="
+        f"{stage3_decision['two_mm_budget']['required_hard3_ale_at_current_core20']:.4f} "
+        f"remaining_gap="
+        f"{stage3_decision['two_mm_budget']['remaining_hard3_gap_mm']:.4f}",
+        flush=True,
+    )
+    if stage3_decision["proposal_gate"]["applied"]:
+        proposal = stage3_decision["proposal_gate"]
+        if args.hard3_refiner_mode == "curve_supervised":
+            print(
+                "Curve-H3 candidate gate: "
+                f"oracle={proposal['gonion_oracle_ale']:.3f} mm "
+                f"p95={proposal['gonion_oracle_p95']:.3f} "
+                f"SDR2={proposal['gonion_oracle_sdr_at_2mm']:.3f} "
+                f"publication_ready={proposal['publication_ready']}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Hard3 bilateral search gate@{proposal['topk']}: "
+                f"LM21={proposal['lm21_recall']:.3f} "
+                f"LM22={proposal['lm22_recall']:.3f} "
+                f"both={proposal['both_recall']:.3f} "
+                f"oracle={proposal['gonion_oracle_ale']:.3f} mm "
+                f"p95={proposal['gonion_oracle_p95']:.3f} "
+                f"SDR2={proposal['gonion_oracle_sdr_at_2mm']:.3f} "
+                f"clinical_both={proposal['clinical_both_coverage']:.3f}",
+                flush=True,
+            )
+    core20_refiner = None
+    core20_policy = None
+    core20_output_dir = None
+    core20_report = {"enabled": False, "reason": "disabled_by_argument"}
+    if getattr(args, "core20_mvsc", False):
+        core20_output_dir = fold_dir / "core20_mvsc_v1"
+        core20_config = core20_config_from_args(args)
+        print(
+            f"Starting Core20-MVSC Stage 4 ({core20_config.ablation}); "
+            "Hard3 coordinates are frozen...",
+            flush=True,
+        )
+        hard3_before = validation["prediction"][:, list(HARD3)].copy()
+        core20_refiner = fit_or_load_core20_refiner(
+            datasets["train"], core20_output_dir, core20_config, device
+        )
+        core20_parameter_count = int(
+            core20_refiner.report.get(
+                "parameter_count",
+                sum(parameter.numel() for parameter in core20_refiner.model.parameters()),
+            )
+        )
+        core20_validation = core20_refiner.predict(
+            datasets["val"], validation, "Core20-MVSC validation patches"
+        )
+        core20_policy = calibrate_core20_policy(
+            validation, core20_validation, core20_config
+        )
+        validation = apply_core20_refinement(
+            validation, core20_validation, core20_policy
+        )
+        np.testing.assert_array_equal(
+            validation["prediction"][:, list(HARD3)], hard3_before
+        )
+        calibration = calibrate_confidence(
+            validation["log_var"], validation["errors"]
+        )
+        validation_metrics = save_evaluation(
+            fold_dir,
+            "val",
+            validation,
+            calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        core20_validation_metrics = save_evaluation(
+            core20_output_dir,
+            "val",
+            validation,
+            calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        write_core20_reports(core20_output_dir, core20_policy, "val")
+        write_core20_split_report(
+            core20_output_dir,
+            "val",
+            validation,
+            core20_validation,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        core20_report = {
+            "enabled": True,
+            "version": "Core20-MVSC-v1",
+            "ablation": core20_config.ablation,
+            "training": core20_refiner.report,
+            "policy": core20_policy,
+            "validation": core20_validation_metrics,
+            "hard3_byte_identical": True,
+        }
+        print(
+            "Core20-MVSC Stage 4: "
+            f"accepted={core20_policy['accepted']} "
+            f"Core20={core20_policy['base_core20']['ale']:.4f}->"
+            f"{core20_policy['selected_core20']['ale']:.4f} "
+            f"oracle={core20_policy['candidate_oracle_core20']['ale']:.4f} "
+            f"P(improved)={core20_policy['bootstrap_vs_base']['probability_improved']:.3f} "
+            f"run_full_cv={core20_policy['run_full_cv']}",
+            flush=True,
+        )
+    if args.validation_only:
+        _, postprocess_version, _ = hard3_artifact_contract(args)
+        result = {
+            "postprocess_version": postprocess_version,
+            "stage2_signature": args.stage2_signature,
+            "parameter_count": parameter_count,
+            "total_inference_parameter_count": (
+                parameter_count + hard3_parameter_count + core20_parameter_count
+            ),
+            "training": training,
+            "hard3_structured": hard3_report,
+            "shape_prior": prior_report,
+            "neural_validation": neural_validation_metrics,
+            "shape_prior_validation": shape_prior_validation_metrics,
+            "stage3_decision": stage3_decision,
+            "core20_stage4": core20_report,
+            "validation": validation_metrics,
+            "test": None,
+        }
+        (fold_dir / "validation_only_summary.json").write_text(
+            json.dumps(result, indent=2), encoding="utf-8"
+        )
+        print("\nValidation-only; test labels remain sealed", flush=True)
+        print(
+            f"All-23 validation ALE: {validation_metrics['overall']['ale']:.4f}",
+            flush=True,
+        )
+        print(
+            f"Core20 validation ALE: {validation_metrics['core20']['ale']:.4f}",
+            flush=True,
+        )
+        print(
+            f"Hard3 validation ALE: {validation_metrics['hard3']['ale']:.4f}",
+            flush=True,
+        )
+        return result
+
+    print(
+        "Checkpoint and validation policies locked. Preparing final test ROIs...",
+        flush=True,
+    )
+    for index in range(len(datasets["test"])):
+        datasets["test"][index]
+        if args.no_tqdm and (
+            (index + 1) % 10 == 0 or index + 1 == len(datasets["test"])
+        ):
+            print(f"Test ROI {index + 1}/{len(datasets['test'])}", flush=True)
+    test = collect_outputs(
+        model,
+        loaders["test"],
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta,
+        force_refined=force_refined,
+    )
+    test = apply_refinement_calibration(test, refinement_calibration)
+    neural_test_metrics = save_evaluation(
+        fold_dir / "neural_only",
+        "test",
+        test,
+        neural_calibration,
+        args.bootstrap_iters,
+        args.seed,
+    )
+    if prior is not None:
+        test = apply_shape_prior(test, prior)
+    shape_prior_test_metrics = save_evaluation(
+        fold_dir / "shape_prior_only",
+        "test",
+        test,
+        shape_prior_calibration,
+        args.bootstrap_iters,
+        args.seed,
+    )
+    hard3_test_metrics = None
+    if hard3_refiner is not None:
+        if args.hard3_refiner_mode in ("dual_view", "curve_supervised"):
+            hard3_test = hard3_refiner.predict(
+                datasets["test"], test, "Hard3 test image-surface patches"
+            )
+        else:
+            hard3_test = hard3_refiner.predict(
+                datasets["test"], "Hard3 test descriptors"
+            )
+        test = hard3_apply(test, hard3_test, hard3_policy)
+        hard3_test_metrics = save_evaluation(
+            hard3_output_dir,
+            "test",
+            test,
+            hard3_calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+    core20_test_metrics = None
+    if core20_refiner is not None:
+        hard3_before = test["prediction"][:, list(HARD3)].copy()
+        core20_test = core20_refiner.predict(
+            datasets["test"], test, "Core20-MVSC test patches"
+        )
+        test = apply_core20_refinement(test, core20_test, core20_policy)
+        np.testing.assert_array_equal(
+            test["prediction"][:, list(HARD3)], hard3_before
+        )
+        core20_test_metrics = save_evaluation(
+            core20_output_dir,
+            "test",
+            test,
+            calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        write_core20_split_report(
+            core20_output_dir,
+            "test",
+            test,
+            core20_test,
+            args.bootstrap_iters,
+            args.seed,
+        )
+    test_metrics = save_evaluation(
+        fold_dir,
+        "test",
+        test,
+        calibration,
+        args.bootstrap_iters,
+        args.seed,
+    )
+    _, postprocess_version, _ = hard3_artifact_contract(args)
+    result = {
+        "postprocess_version": postprocess_version,
+        "stage2_signature": args.stage2_signature,
+        "parameter_count": parameter_count,
+        "total_inference_parameter_count": (
+            parameter_count + hard3_parameter_count + core20_parameter_count
+        ),
+        "training": training,
+        "hard3_structured": {
+            **hard3_report,
+            "test": hard3_test_metrics,
+        },
+        "shape_prior": prior_report,
+        "neural_validation": neural_validation_metrics,
+        "neural_test": neural_test_metrics,
+        "shape_prior_validation": shape_prior_validation_metrics,
+        "shape_prior_test": shape_prior_test_metrics,
+        "stage3_decision": stage3_decision,
+        "core20_stage4": {
+            **core20_report,
+            "test": core20_test_metrics,
+        },
+        "validation": validation_metrics,
+        "test": test_metrics,
+    }
+    (fold_dir / "run_summary.json").write_text(
+        json.dumps(result, indent=2), encoding="utf-8"
+    )
+    print("\nEvaluation against expert orthodontist landmarks", flush=True)
+    print(f"AGH vNext All-23 ALE: {test_metrics['overall']['ale']:.4f}", flush=True)
+    print(f"Core20 ALE: {test_metrics['core20']['ale']:.4f}", flush=True)
+    print(f"Hard3 ALE: {test_metrics['hard3']['ale']:.4f}", flush=True)
+    print(f"Median: {test_metrics['overall']['median']:.4f}", flush=True)
+    return result
+
+
+def aggregate(output_dir, summaries, elapsed):
+    rows = []
+    for item in summaries:
+        result = item["result"]
+        metrics = result.get("test") or result["validation"]
+        hard3_training_seconds = (
+            result.get("hard3_structured", {})
+            .get("training", {})
+            .get("training_seconds", 0.0)
+        )
+        core20_training_seconds = (
+            result.get("core20_stage4", {})
+            .get("training", {})
+            .get("training_seconds", 0.0)
+        )
+        training_seconds = (
+            result["training"].get("training_seconds", 0.0)
+            + result["training"].get("separate_gate", {}).get("training_seconds", 0.0)
+            + hard3_training_seconds
+            + core20_training_seconds
+        )
+        rows.append(
+            {
+                "repeat": item["repeat"],
+                "fold": item["fold"],
+                "split": "test" if result.get("test") else "validation",
+                "overall_ale": metrics["overall"]["ale"],
+                "median": metrics["overall"]["median"],
+                "std": metrics["overall"]["std"],
+                "core20_ale": metrics["core20"]["ale"],
+                "hard3_ale": metrics["hard3"]["ale"],
+                "sdr_at_2mm": metrics["overall"]["sdr_at_2mm"],
+                "sdr_at_3mm": metrics["overall"]["sdr_at_3mm"],
+                "sdr_at_4mm": metrics["overall"]["sdr_at_4mm"],
+                "parameter_count": result.get(
+                    "total_inference_parameter_count",
+                    result["parameter_count"],
+                ),
+                "training_seconds": float(training_seconds),
+            }
+        )
+    write_csv(Path(output_dir) / "summary_fold_metrics.csv", rows)
+    overall = np.asarray([row["overall_ale"] for row in rows], dtype=np.float64)
+    payload = {
+        "model": "AGH-Former vNext",
+        "fold_count": len(rows),
+        "fold_mean_ale": float(overall.mean()),
+        "fold_std_ale": float(overall.std()),
+        "elapsed_seconds": float(elapsed),
+        "folds": rows,
+    }
+    (Path(output_dir) / "summary_metrics.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    return payload
+
+
+def load_completed_fold(fold_dir, args, splits):
+    if not args.resume_stage2 or args.force_stage2_retrain or args.validation_only:
+        return None
+    fold_dir = Path(fold_dir)
+    summary_path = fold_dir / "run_summary.json"
+    required = (
+        fold_dir / "metrics_val.json",
+        fold_dir / "metrics_test.json",
+        fold_dir / "predictions_test.csv",
+    )
+    if not summary_path.exists() or not all(path.exists() for path in required):
+        return None
+    result = json.loads(summary_path.read_text(encoding="utf-8"))
+    if result.get("stage2_signature") != vnext_signature(args, splits):
+        return None
+    if args.hard3_structured:
+        hard3_mode = getattr(args, "hard3_refiner_mode", "structured")
+        hard3_name, expected_postprocess_version, checkpoint_name = (
+            hard3_artifact_contract(args)
+        )
+        hard3_root = fold_dir / hard3_name
+        checkpoint = hard3_root / checkpoint_name
+        hard3_required = (
+            checkpoint,
+            hard3_root / "metrics_val.json",
+            hard3_root / "metrics_test.json",
+        )
+        valid_postprocess_version = (
+            result.get("postprocess_version") in (1, 2)
+            if hard3_mode == "structured"
+            else result.get("postprocess_version") == expected_postprocess_version
+        )
+        stored_mode = result.get("hard3_structured", {}).get("mode", "structured")
+        if (
+            not valid_postprocess_version
+            or not result.get("hard3_structured", {}).get("enabled", False)
+            or stored_mode != hard3_mode
+            or not all(path.exists() for path in hard3_required)
+        ):
+            print(
+                f"Completed Stage 2 found, but Hard3 Stage 3 is missing: {fold_dir}",
+                flush=True,
+            )
+            return None
+    if getattr(args, "core20_mvsc", False):
+        core20_root = fold_dir / "core20_mvsc_v1"
+        core20_required = (
+            core20_root / "best_model.pth",
+            core20_root / "spatial_prior.json",
+            core20_root / "core20_stage4_decision.json",
+            core20_root / "metrics_val.json",
+            core20_root / "metrics_test.json",
+        )
+        if (
+            not result.get("core20_stage4", {}).get("enabled", False)
+            or not all(path.exists() for path in core20_required)
+        ):
+            print(
+                f"Completed upstream stages found, but Core20 Stage 4 is missing: {fold_dir}",
+                flush=True,
+            )
+            return None
+    print(f"Completed AGH vNext fold cached: {fold_dir}", flush=True)
+    return result
+
+
+def main():
+    args = configure_vnext(build_parser().parse_args())
+    set_seed(args.seed)
+    device = resolve_device(args.device)
+    resolve_precision(args, device)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    samples = discover_samples(args.data_root)
+    preprocessing_root = (
+        validate_preprocessing_root(args.preprocessing_root, args)
+        if args.preprocessing_root
+        else None
+    )
+    anatomy = {
+        "landmarks": list(enumerate(LANDMARK_NAMES)),
+        "midline": list(MIDLINE),
+        "symmetry_pairs": [list(pair) for pair in SYMMETRY_PAIRS],
+        "anatomical_edges": [list(edge) for edge in ANATOMICAL_EDGES],
+    }
+    (output_dir / "anatomy_schema.json").write_text(
+        json.dumps(anatomy, indent=2), encoding="utf-8"
+    )
+    (output_dir / "experiment_config.json").write_text(
+        json.dumps(vars(args), indent=2), encoding="utf-8"
+    )
+    print(
+        f"Device: {device}; samples={len(samples)}; model=AGH-Former vNext",
+        flush=True,
+    )
+    print(
+        f"Alignment: {args.alignment}; coarse source: {args.coarse_source}; "
+        f"shape prior: {args.shape_prior}",
+        flush=True,
+    )
+
+    if args.protocol == "fixed":
+        if not args.splits_json:
+            raise ValueError("--protocol fixed requires --splits-json")
+        fold_specs = [
+            (1, 1, limit_splits(load_split_file(args.splits_json), args.max_samples))
+        ]
+    else:
+        fold_specs = []
+        for repeat in range(1, args.cv_repeats + 1):
+            for fold_index, split in enumerate(
+                make_cv_splits(
+                    samples,
+                    args.folds,
+                    args.val_fraction,
+                    args.seed + (repeat - 1) * 1009,
+                ),
+                start=1,
+            ):
+                fold_specs.append(
+                    (repeat, fold_index, limit_splits(split, args.max_samples))
+                )
+    if args.fold_indices:
+        requested = {
+            int(value) for value in str(args.fold_indices).split(",") if value.strip()
+        }
+        fold_specs = [item for item in fold_specs if item[1] in requested]
+    if not fold_specs:
+        raise ValueError("No folds selected")
+
+    started = time.time()
+    summaries = []
+    for run_index, (repeat, fold_index, splits) in enumerate(fold_specs, start=1):
+        fold_dir = fold_output_dir(output_dir, args, repeat, fold_index)
+        preprocessing_dir = (
+            fold_output_dir(preprocessing_root, args, repeat, fold_index)
+            if preprocessing_root
+            else None
+        )
+        print(
+            f"\nRun {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index} "
+            f"train/val/test={len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}",
+            flush=True,
+        )
+        if args.preflight_only:
+            datasets, _ = prepare_fold(
+                samples,
+                splits,
+                args,
+                fold_dir,
+                device,
+                enforce_oracle_gate=False,
+                preprocessing_dir=preprocessing_dir,
+            )
+            if args.core20_mvsc:
+                run_core20_preflight(
+                    datasets["train"],
+                    datasets["val"],
+                    fold_dir / "core20_mvsc_v1",
+                    core20_config_from_args(args),
+                    device,
+                )
+            print(f"Preflight fold {fold_index} complete", flush=True)
+            continue
+        result = load_completed_fold(fold_dir, args, splits)
+        if result is None:
+            result = run_fold(
+                samples,
+                splits,
+                args,
+                fold_dir,
+                device,
+                preprocessing_dir,
+            )
+        summaries.append({"repeat": repeat, "fold": fold_index, "result": result})
+    if args.preflight_only:
+        (output_dir / "preflight_complete.json").write_text(
+            json.dumps({"complete": True, "fold_count": len(fold_specs)}, indent=2),
+            encoding="utf-8",
+        )
+        return
+    summary = aggregate(output_dir, summaries, time.time() - started)
+    print(
+        f"\nFold ALE: {summary['fold_mean_ale']:.4f} +/- "
+        f"{summary['fold_std_ale']:.4f}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

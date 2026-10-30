@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+CODE_ROOT = Path("/content/mesh-multiview-facial-landmarks")
+DATA_ROOT = Path("/content/drive/MyDrive/orthodontic/data/dataset")
+RUN_ROOT = Path("/content/drive/MyDrive/orthodontic/agh_vnext_runs")
+SPLITS_JSON = CODE_ROOT / "configs/folds_180_60_60_seed42.json"
+PREPROCESSING_ROOT = Path(
+    "/content/drive/MyDrive/orthodontic/all23_rgb_geodesic_runs/"
+    "publication_cv_stage1_v4_seed42"
+)
+
+
+def require_hard3_development_gate(output_dir):
+    decision_path = Path(output_dir) / "fold_1/hard3_stage3_decision.json"
+    if not decision_path.exists():
+        raise RuntimeError(
+            "Fold 1 Hard3 gate is missing. Run --preset hard3_fold1 before --preset cv: "
+            f"{decision_path}"
+        )
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    if not decision.get("run_full_cv", False):
+        failed = [
+            name for name, passed in decision.get("checks", {}).items() if not passed
+        ]
+        raise RuntimeError(
+            "Fold 1 Hard3 gate failed; full CV is intentionally blocked. "
+            f"Failed checks: {failed or ['run_full_cv']}"
+        )
+    return decision
+
+
+def require_core20_development_gate(output_dir):
+    decision_path = Path(output_dir) / "fold_1/core20_mvsc_v1/core20_stage4_decision.json"
+    if not decision_path.exists():
+        raise RuntimeError(
+            "Fold 1 Core20-MVSC gate is missing. Run --preset core20_fold1 first: "
+            f"{decision_path}"
+        )
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    if not decision.get("run_full_cv", False):
+        failed = [
+            name for name, passed in decision.get("checks", {}).items() if not passed
+        ]
+        raise RuntimeError(
+            "Fold 1 Core20-MVSC gate failed; four expensive folds remain blocked. "
+            f"Failed checks: {failed or ['run_full_cv']}"
+        )
+    return decision
+
+
+def command_for(preset, seed, fold_indices):
+    script = (
+        CODE_ROOT / "facial_landmarks/stage2/runner.py"
+    )
+    common = [
+        sys.executable,
+        "-u",
+        str(script),
+        "--data-root",
+        str(DATA_ROOT),
+        "--device",
+        "auto",
+        "--mixed-precision",
+        "--amp-dtype",
+        "bfloat16",
+        "--no-tqdm",
+        "--seed",
+        str(seed),
+    ]
+    if preset == "smoke":
+        return common + [
+            "--output-dir",
+            str(RUN_ROOT / f"smoke_seed{seed}"),
+            "--protocol",
+            "fixed",
+            "--splits-json",
+            str(SPLITS_JSON),
+            "--coarse-source",
+            "train_template",
+            "--train-center-mode",
+            "template",
+            "--max-samples",
+            "24",
+            "--folds",
+            "2",
+            "--roi-points",
+            "128",
+            "--icp-points",
+            "512",
+            "--icp-iterations",
+            "3",
+            "--atlas-size",
+            "2",
+            "--atlas-iterations",
+            "1",
+            "--registration-candidates",
+            "1",
+            "--registration-restarts",
+            "1",
+            "--roi-radius-scale",
+            "1.5",
+            "--width",
+            "32",
+            "--global-blocks",
+            "1",
+            "--token-blocks",
+            "1",
+            "--token-surface-points",
+            "512",
+            "--epochs",
+            "2",
+            "--min-epochs",
+            "1",
+            "--patience",
+            "1",
+            "--gate-stage-epochs",
+            "1",
+            "--gate-stage-min-epochs",
+            "1",
+            "--gate-stage-patience",
+            "1",
+            "--bootstrap-iters",
+            "50",
+            "--hard3-structured-folds",
+            "2",
+            "--hard3-structured-epochs",
+            "2",
+            "--hard3-structured-min-epochs",
+            "1",
+            "--hard3-structured-patience",
+            "1",
+            "--hard3-structured-batch-size",
+            "4",
+            "--hard3-structured-width",
+            "16",
+            "--hard3-structured-pair-topk",
+            "4",
+            "--hard3-refiner-mode",
+            "dual_view",
+            "--hard3-dual-view-folds",
+            "2",
+            "--hard3-dual-view-epochs",
+            "2",
+            "--hard3-dual-view-min-epochs",
+            "1",
+            "--hard3-dual-view-patience",
+            "1",
+            "--hard3-dual-view-batch-size",
+            "4",
+            "--hard3-dual-view-image-size",
+            "32",
+            "--hard3-dual-view-width",
+            "8",
+            "--hard3-dual-view-proposal-topk",
+            "16",
+            "--hard3-dual-view-pair-topk",
+            "16",
+            "--hard3-dual-view-decoder-mode",
+            "crossfit_mixture_state",
+            "--hard3-dual-view-mixture-shortlist",
+            "16",
+            "--hard3-dual-view-mixture-feature-modes",
+            "coordinate",
+            "--hard3-dual-view-mixture-l2-grid",
+            "1",
+            "--hard3-dual-view-mixture-alpha-grid",
+            "0.5,1",
+            "--hard3-dual-view-proposal-neighbors",
+            "4",
+            "--hard3-dual-view-pair-stage-epochs",
+            "1",
+            "--hard3-dual-view-pair-stage-min-epochs",
+            "1",
+            "--hard3-dual-view-pair-stage-patience",
+            "1",
+            "--hard3-dual-view-final-members",
+            "1",
+            "--hard3-dual-view-final-policy",
+            "median_best_refit",
+            "--skip-oracle-gate",
+            "--max-stage2-val-ale",
+            "200",
+            "--no-shape-prior",
+            "--no-tta",
+            "--no-tta-validation",
+        ]
+    output_name = (
+        f"publication_cv_preflight_seed{seed}"
+        if preset == "cv_preflight"
+        else f"publication_cv_seed{seed}"
+    )
+    command = common + [
+        "--output-dir",
+        str(RUN_ROOT / output_name),
+        "--protocol",
+        "cv",
+        "--folds",
+        "5",
+        "--cv-repeats",
+        "1",
+        "--coarse-source",
+        "stage1_oof",
+        "--train-center-mode",
+        "external",
+        "--alignment",
+        "mesh_icp",
+        "--registration-roi-expansion",
+        "0.75",
+        "--roi-points",
+        "1024",
+        "--roi-radius-scale",
+        "1.5",
+        "--width",
+        "128",
+        "--global-blocks",
+        "4",
+        "--token-blocks",
+        "2",
+        "--token-surface-points",
+        "4096",
+        "--epochs",
+        "220",
+        "--min-epochs",
+        "80",
+        "--patience",
+        "35",
+        "--lr",
+        "0.0003",
+        "--stage1-oof-folds",
+        "5",
+        "--stage1-oof-fixed-epochs",
+        "120",
+        "--stage1-width",
+        "96",
+        "--stage1-blocks",
+        "3",
+        "--stage1-epochs",
+        "100",
+        "--stage1-min-epochs",
+        "60",
+        "--stage1-patience",
+        "20",
+        "--hard3-refiner-mode",
+        "dual_view",
+        "--hard3-dual-view-decoder-mode",
+        "crossfit_mixture_state",
+        "--hard3-dual-view-mixture-shortlist",
+        "96",
+        "--hard3-dual-view-mixture-feature-modes",
+        "coordinate,evidence,evidence_shape",
+        "--hard3-dual-view-mixture-l2-grid",
+        "0.01,0.1,1,10,100",
+        "--hard3-dual-view-mixture-alpha-grid",
+        "0.25,0.5,0.75,1",
+        "--hard3-dual-view-proposal-topk",
+        "96",
+        "--hard3-dual-view-pair-topk",
+        "96",
+        "--hard3-dual-view-proposal-neighbors",
+        "12",
+        "--hard3-dual-view-teacher-forcing-epochs",
+        "0",
+        "--hard3-dual-view-pair-stage-epochs",
+        "50",
+        "--hard3-dual-view-pair-stage-min-epochs",
+        "12",
+        "--hard3-dual-view-pair-stage-patience",
+        "12",
+        "--hard3-dual-view-pair-stage-lr",
+        "0.0005",
+        "--hard3-dual-view-pair-target-sigma",
+        "1.5",
+        "--hard3-dual-view-pair-listwise-weight",
+        "0.75",
+        "--hard3-dual-view-pair-unary-listwise-weight",
+        "0.5",
+        "--hard3-dual-view-pair-clinical-radius-mm",
+        "2.0",
+        "--hard3-dual-view-pair-clinical-mass-weight",
+        "1.0",
+        "--hard3-dual-view-pair-expected-distance-weight",
+        "0.5",
+        "--hard3-dual-view-pair-hard-negative-weight",
+        "0.25",
+        "--hard3-dual-view-pair-hard-negative-radius-mm",
+        "4.0",
+        "--hard3-dual-view-pair-hard-negative-count",
+        "64",
+        "--hard3-dual-view-pair-validation-mode",
+        "pair_argmax",
+        "--hard3-dual-view-contour-state-weight",
+        "1.0",
+        "--hard3-dual-view-contour-moment-weight",
+        "0.5",
+        "--hard3-dual-view-contour-state-scale",
+        "0.03",
+        "--hard3-dual-view-contour-residual-limit",
+        "0.20",
+        "--hard3-dual-view-final-policy",
+        "inner_fold_ensemble",
+        "--hard3-dual-view-diagnostic-topk",
+        "32,48,96",
+        "--hard3-dual-view-min-proposal-recall",
+        "0.90",
+        "--hard3-dual-view-max-proposal-oracle-ale",
+        "1.50",
+        "--hard3-dual-view-min-proposal-sdr2",
+        "0.75",
+        "--hard3-dual-view-max-proposal-oracle-p95",
+        "3.50",
+    ]
+    if PREPROCESSING_ROOT.exists():
+        command.extend(["--preprocessing-root", str(PREPROCESSING_ROOT)])
+    if fold_indices:
+        command.extend(["--fold-indices", fold_indices])
+    if preset.startswith("core20_"):
+        command.extend(
+            [
+                "--core20-mvsc",
+                "--core20-mvsc-ablation",
+                "C4",
+                "--core20-mvsc-epochs",
+                "120",
+                "--core20-mvsc-min-epochs",
+                "40",
+                "--core20-mvsc-patience",
+                "25",
+                "--core20-mvsc-batch-size",
+                "32",
+                "--core20-mvsc-image-size",
+                "96",
+                "--core20-mvsc-width",
+                "48",
+                "--core20-mvsc-lr",
+                "0.0003",
+                "--core20-mvsc-coordinate-topk",
+                "8",
+                "--core20-mvsc-target-ale",
+                "1.70",
+                "--core20-mvsc-stretch-ale",
+                "1.647",
+                # Freeze the empirically strongest Hard3 revision (V10).
+                "--hard3-dual-view-decoder-mode",
+                "crossfit_set_context",
+            ]
+        )
+    if preset in ("cv_preflight", "core20_preflight"):
+        command.append("--preflight-only")
+        if preset == "core20_preflight":
+            command.extend(["--fold-indices", "1"])
+    elif preset in ("dev_fold1", "hard3_fold1", "core20_fold1"):
+        command.extend(["--fold-indices", "1", "--validation-only"])
+    return command
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Colab runner for AGH-Former vNext")
+    parser.add_argument(
+        "--preset",
+        choices=(
+            "smoke",
+            "cv_preflight",
+            "dev_fold1",
+            "hard3_fold1",
+            "cv",
+            "core20_preflight",
+            "core20_fold1",
+            "core20_cv",
+        ),
+        default="smoke",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fold-indices", default=None)
+    args = parser.parse_args()
+    if not DATA_ROOT.exists():
+        raise FileNotFoundError(f"Dataset not found: {DATA_ROOT}")
+    RUN_ROOT.mkdir(parents=True, exist_ok=True)
+    command = command_for(args.preset, args.seed, args.fold_indices)
+    if args.preset == "cv":
+        require_hard3_development_gate(RUN_ROOT / f"publication_cv_seed{args.seed}")
+    elif args.preset == "core20_cv":
+        require_core20_development_gate(
+            RUN_ROOT / f"publication_cv_seed{args.seed}"
+        )
+    print("Working directory:", CODE_ROOT, flush=True)
+    print("Running:", " ".join(map(str, command)), flush=True)
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    subprocess.run(command, cwd=str(CODE_ROOT), check=True, env=environment)
+
+
+if __name__ == "__main__":
+    main()

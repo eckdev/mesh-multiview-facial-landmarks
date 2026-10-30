@@ -1,0 +1,41 @@
+{
+  "version": "AGH-Former-v2.1",
+  "decision": "report this run's locked validation policies as the final model",
+  "commitment": "The test split is opened once after this file is written and the result is reported for this model whatever it is; no model will be re-selected using test results.",
+  "rationale": "Post-test amendment: participant metadata (class and sex) were removed from the spatial prior after a descriptive check on the reference coordinates showed no meaningful contribution; the model uses the 3D scan only. The test partitions had been evaluated with the previous version (publication_cv_v2final_seed42). Primary endpoint: all-23 ALE.",
+  "validation_gate": {
+    "v2_validation": {
+      "all23": 1.994838488591916,
+      "core20": 1.581343665701958,
+      "hard3": 4.751470641191635
+    },
+    "vnext_validation": {
+      "all23": 2.0574719700955555,
+      "core20": 1.6788380926513733,
+      "hard3": 4.581697819723437
+    },
+    "checks": {
+      "all23_not_worse": true,
+      "hard3_regression_at_most_0p10": false,
+      "core20_regression_at_most_0p05": true
+    },
+    "run_final_test": false
+  },
+  "folds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "lock_sha256": {
+    "1": "4f6779888db807daac8738900c511ea94280e5f733c487298f379ef45c4cbcc3",
+    "2": "15eb79b061f50724f2d4771c8dd9fba5bcb22bca4c7111e7e5e8f20fc9060b46",
+    "3": "ed958ca298c678263616ffe9ca3fa730a6d69dac12ceb57fe379d52317426f62",
+    "4": "2fbc201886c5068f72b4c37ed3c80cdc7deabb1ab90e5dd3b901b8db4e2193fd",
+    "5": "9f0f1f65e4e38729ef56d54472947de9e6c9fdb42b9e3f15387ff7ffa88c3023"
+  },
+  "created_utc": "2026-10-25T18:47:15.054096+00:00",
+  "git_commit": "fa6d427fde6c0fc05e139adc39daac7021de2f16",
+  "test_labels_consumed": false
+}

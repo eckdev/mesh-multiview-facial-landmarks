@@ -1,0 +1,9 @@
+# Tested with Python 3.12 (local tests) and the Colab GPU runtime used for the
+# experiments (Python 3.13, PyTorch 2.11, CUDA 13.0).
+torch>=2.5
+numpy>=1.26
+scipy>=1.13
+scikit-learn>=1.5
+trimesh>=4.0
+tqdm>=4.66
+pytest>=8.0
