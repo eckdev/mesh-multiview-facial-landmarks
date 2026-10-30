@@ -68,16 +68,6 @@ data and to earlier stage outputs are set at the top of
 networks. That code needs their separate implementations, which are not part of
 this repository. Use `--models proposed` to time the proposed model only.
 
-## Names kept from development
-
-The packages were renamed for this release. Class names (for example
-`AGHFormerVNext`, `All23MVSCNet`), command-line options (`--all23-*`), preset
-names and output folder names (`fold_k/all23_mvsc`) were kept, because they are
-part of the stored configurations and configuration signatures. Changing them
-would make the trained models unusable.
-
-`facial_landmarks/_checkpoint_compat.py` maps the original package names to the
-renamed modules, so that checkpoints saved before the renaming still load.
 
 ## Trained models
 
